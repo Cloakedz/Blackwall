@@ -1,0 +1,381 @@
+// Blackwall: a small tabbed web browser in the Sothis style. Everything it keeps (sign-ins, history, bookmarks,
+// settings) stays in %APPDATA%\Blackwall on this PC.
+const { app, BrowserWindow, ipcMain, session, Menu, clipboard, shell, nativeImage, dialog, webContents } = require("electron");
+const path = require("path"), fs = require("fs");
+
+app.setAppUserModelId("Blackwall");
+// use less memory: let tabs of the same site share a process. (No page memory ceiling: a 1 GB cap made heavy sites
+// like YouTube and Google Docs run out of memory and crash, taking every tab sharing their process with them.)
+app.commandLine.appendSwitch("renderer-process-limit", "8");
+app.commandLine.appendSwitch("disable-features", "BackForwardCache,SpareRendererForSitePerProcess");
+// crash dumps stay on this PC (%APPDATA%\Blackwall\Crashpad); nothing is uploaded
+try { require("electron").crashReporter.start({ uploadToServer: false }); } catch {}
+// your data folder is %APPDATA%\Blackwall; it was "Sothis Browser" before the rename, so that one moves over (sign-ins, tabs, bookmarks)
+{
+  const OLD = path.join(app.getPath("appData"), "Sothis Browser"), NEW = path.join(app.getPath("appData"), "Blackwall");
+  let use = NEW;
+  try { if (fs.existsSync(OLD) && !fs.existsSync(NEW)) fs.renameSync(OLD, NEW); } catch { if (fs.existsSync(OLD) && !fs.existsSync(NEW)) use = OLD; }
+  app.setPath("userData", use);
+}
+if (!app.requestSingleInstanceLock()) { app.quit(); return; }
+
+const DATA = app.getPath("userData");
+const SET_FILE = path.join(DATA, "settings.json");
+let settings = {}; try { settings = JSON.parse(fs.readFileSync(SET_FILE, "utf8")) || {}; } catch {}
+// force dark: darkens pages that only have a light theme (needs a restart to change). It's applied to each page's
+// tab below, not app-wide, so Blackwall's own window (the red logo) is never recoloured.
+const DARK_AT_START = !!settings.forceDark;
+const saveSettings = () => { try { fs.writeFileSync(SET_FILE, JSON.stringify(settings, null, 1)); } catch {} };
+
+// the current Chrome version (Chrome ships every 4 weeks; 131 came out 12 Nov 2024): Google turns away out-of-date browsers too
+const CHROME_MAJOR = String(Math.max(+process.versions.chrome.split(".")[0], 131 + Math.floor((Date.now() - Date.UTC(2024, 10, 12)) / (28 * 864e5))));
+const CHROME_UA = `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${CHROME_MAJOR}.0.0.0 Safari/537.36`;
+app.userAgentFallback = CHROME_UA;
+
+/* ---------- ad and tracker blocking ---------- */
+const AD_BUILTIN = ["doubleclick.net", "googlesyndication.com", "googleadservices.com", "adservice.google.com", "pagead2.googlesyndication.com", "googletagservices.com",
+  "google-analytics.com", "adnxs.com", "adsrvr.org", "advertising.com", "amazon-adsystem.com", "taboola.com", "outbrain.com", "criteo.com", "criteo.net", "pubmatic.com",
+  "rubiconproject.com", "openx.net", "casalemedia.com", "smartadserver.com", "moatads.com", "scorecardresearch.com", "quantserve.com", "adform.net", "yieldmo.com",
+  "sharethrough.com", "teads.tv", "media.net", "zedo.com", "propellerads.com", "popads.net", "popcash.net", "adcash.com", "exoclick.com", "juicyads.com",
+  "trafficjunky.net", "mgid.com", "revcontent.com", "adroll.com", "bidswitch.net", "33across.com", "indexww.com", "lijit.com", "sovrn.com", "contextweb.com",
+  "spotxchange.com", "spotx.tv", "springserve.com", "unrulymedia.com", "yieldlab.net", "adition.com", "adsafeprotected.com", "doubleverify.com", "imasdk.googleapis.com",
+  "ads.yahoo.com", "ads.twitter.com", "ads-twitter.com", "static.ads-twitter.com", "ads.linkedin.com", "adsymptotic.com", "hotjar.com", "mouseflow.com", "zergnet.com",
+  "onclickads.net", "onclkds.com", "adsterra.com", "hilltopads.net", "clickadu.com", "admaven.com", "a-ads.com", "coinzilla.com", "bitmedia.io", "ad.plus", "adskeeper.com"];
+let adHosts = new Set(AD_BUILTIN);
+// the ones that follow you around (analytics, session recording, data brokers) rather than show ads
+const TRACK_RX = /(analytics|metric|telemetry|stats|track|pixel|beacon|collect|insight|hotjar|mouseflow|scorecardresearch|quantserve|quantcount|moatads|doubleverify|adsafeprotected|chartbeat|newrelic|nr-data|segment|mixpanel|amplitude|heap|fullstory|clarity|bluekai|demdex|omtrdc|krxd|rlcdn|bounceexchange|tapad|crwdcntrl|agkn|exelator|addthis|sharethis|optimizely|branch\.io|appsflyer|adjust\.com|kochava)/i;
+const isTracker = h => TRACK_RX.test(h);
+const adCounts = new Map();
+function adIsBlocked(host) { for (let h = host; h && h.includes("."); h = h.slice(h.indexOf(".") + 1)) if (adHosts.has(h)) return true; return false; }
+async function adLoad() {
+  const f = path.join(DATA, "adblock-hosts.txt");
+  const use = txt => { const set = new Set(AD_BUILTIN); for (const l of String(txt).split(/\r?\n/)) { const h = l.trim().toLowerCase(); if (h && !h.startsWith("#") && /^[a-z0-9.-]+\.[a-z]{2,}$/.test(h)) set.add(h); } if (set.size > AD_BUILTIN.length) adHosts = set; };
+  try { use(fs.readFileSync(f, "utf8")); } catch {}
+  try {
+    const st = fs.existsSync(f) ? fs.statSync(f) : null;
+    if (st && Date.now() - st.mtimeMs < 3 * 864e5) return;
+    const { net } = require("electron");
+    const r = await net.fetch("https://pgl.yoyo.org/adservers/serverlist.php?hostformat=nohtml&showintro=0&mimetype=plaintext");
+    if (r.ok) { const t = await r.text(); if (t.length > 1000) { fs.writeFileSync(f, t); use(t); } }
+  } catch {}
+}
+
+/* ---------- site permissions ---------- */
+const siteOf = u => { try { const x = new URL(String(u)); return /^https?:$/.test(x.protocol) ? x.hostname.replace(/^www\./, "") : ""; } catch { return ""; } };
+function permKinds(perm, det) {
+  if (perm === "media") { const t = (det && det.mediaTypes) || []; const out = []; if (!t.length || t.includes("video")) out.push("camera"); if (!t.length || t.includes("audio")) out.push("mic"); return out; }
+  if (perm === "geolocation") return ["location"];
+  if (perm === "notifications") return ["notifications"];
+  return [];
+}
+const permGet = (site, k) => ((settings.perms || {})[site] || {})[k] || "ask";
+function permSet(site, k, v) { settings.perms = settings.perms || {}; const p = settings.perms[site] = settings.perms[site] || {}; if (v === "ask") delete p[k]; else p[k] = v; if (!Object.keys(p).length) delete settings.perms[site]; saveSettings(); }
+let permSeq = 0; const permWait = new Map();
+
+let win = null;   // the main window (its tabs are the ones remembered); tabs dragged out get windows of their own
+const wins = new Set();
+const sendWc = (wc, ch, d) => { try { if (wc && !wc.isDestroyed()) wc.send(ch, d); } catch {} };
+const send = (ch, d) => { if (win && !win.isDestroyed()) sendWc(win.webContents, ch, d); };
+const sendAll = (ch, d) => { for (const w of wins) if (!w.isDestroyed()) sendWc(w.webContents, ch, d); };
+// a page's messages go to the window its tab is in
+const hostOf = c => (c && !c.isDestroyed() && c.hostWebContents) || (win && !win.isDestroyed() ? win.webContents : null);
+
+function setupSession() {
+  const ses = session.fromPartition("persist:web");
+  ses.setUserAgent(CHROME_UA);
+  // camera, microphone, location and notifications: asked per site, and your answer is kept (change it from the lock in the address bar)
+  ses.setPermissionRequestHandler((wc, perm, cb, det) => {
+    if (["fullscreen", "clipboard-sanitized-write", "pointerLock", "keyboardLock"].includes(perm)) return cb(true);
+    const kinds = permKinds(perm, det); if (!kinds.length) return cb(false);
+    const site = siteOf((det && det.requestingUrl) || (wc && wc.getURL()));
+    if (!site) return cb(false);
+    const got = kinds.map(k => permGet(site, k));
+    if (got.includes("block")) return cb(false);
+    if (got.every(v => v === "allow")) return cb(true);
+    const id = ++permSeq; permWait.set(id, { cb, site, kinds });
+    sendWc(hostOf(wc), "perm:ask", { id, site, kinds });
+  });
+  ses.setPermissionCheckHandler((wc, perm, origin, det) => {
+    if (["fullscreen", "clipboard-sanitized-write", "pointerLock", "keyboardLock"].includes(perm)) return true;
+    const kinds = permKinds(perm, det || {}); if (!kinds.length) return perm !== "notifications" && perm !== "geolocation" && perm !== "media";
+    const site = siteOf(origin || (wc && wc.getURL()));
+    return !!site && kinds.every(k => permGet(site, k) === "allow");
+  });
+  ses.webRequest.onBeforeRequest({ urls: ["http://*/*", "https://*/*"] }, (d, cb) => {
+    if (settings.adBlock === false || d.resourceType === "mainFrame") return cb({});
+    let host = ""; try { host = new URL(d.url).hostname.toLowerCase(); } catch { return cb({}); }
+    if (!adIsBlocked(host)) return cb({});
+    let page = "";
+    if (d.webContentsId) { try { const { webContents } = require("electron"); const w = webContents.fromId(d.webContentsId); page = w ? new URL(w.getURL()).hostname.replace(/^www\./, "") : ""; } catch {} }
+    if (page && (settings.adAllow || []).includes(page)) return cb({});   // you turned the shield off for this site
+    if (d.webContentsId) { const n = (adCounts.get(d.webContentsId) || 0) + 1; adCounts.set(d.webContentsId, n); sendWc(hostOf(webContents.fromId(d.webContentsId)), "web:blocked", { id: d.webContentsId, n, host, tracker: isTracker(host) }); }
+    cb({ cancel: true });
+  });
+  // downloads go straight to your Downloads folder, with progress in the downloads list
+  ses.on("will-download", (_e, item, wc) => {
+    const to = hostOf(wc);
+    const dir = app.getPath("downloads");
+    let name = item.getFilename() || "download", file = path.join(dir, name), n = 1;
+    while (fs.existsSync(file)) { const ext = path.extname(name); file = path.join(dir, path.basename(name, ext) + " (" + n++ + ")" + ext); }
+    item.setSavePath(file);
+    const id = Date.now() + Math.random();
+    const upd = state => { const d = { id, name: path.basename(file), file, state, got: item.getReceivedBytes(), total: item.getTotalBytes() }; if (to && !to.isDestroyed()) sendWc(to, "dl:update", d); else send("dl:update", d); };
+    upd("progress");
+    item.on("updated", (_e2, st) => upd(st === "interrupted" ? "interrupted" : "progress"));
+    item.once("done", (_e2, st) => upd(st));
+  });
+  return ses;
+}
+
+// what crashed and why, kept in %APPDATA%\Blackwall\crash.log (newest last, trimmed to the last 200 lines)
+function crashLog(what, d) {
+  try {
+    const f = path.join(DATA, "crash.log");
+    const line = new Date().toISOString() + "  " + what + "  " + JSON.stringify(d) + "\n";
+    let old = ""; try { old = fs.readFileSync(f, "utf8"); } catch {}
+    fs.writeFileSync(f, (old + line).split("\n").slice(-201).join("\n"));
+  } catch {}
+}
+app.on("child-process-gone", (_e, d) => { if (d.reason !== "clean-exit") crashLog("process " + d.type, { reason: d.reason, exitCode: d.exitCode, name: d.name || "" }); });
+process.on("uncaughtException", err => crashLog("main error", { msg: String(err && err.stack || err).slice(0, 600) }));
+app.on("web-contents-created", (_e, c) => {
+  c.on("render-process-gone", (_ev, d) => crashLog(c.getType() === "webview" ? "tab" : "window", { reason: d.reason, exitCode: d.exitCode, url: (() => { try { return new URL(c.getURL()).hostname; } catch { return ""; } })() }));
+  c.on("unresponsive", () => crashLog(c.getType() === "webview" ? "tab froze" : "window froze", { url: (() => { try { return new URL(c.getURL()).hostname; } catch { return ""; } })() }));
+  if (c.getType() !== "webview") return;
+  // Every page sees one consistent, real Google Chrome: the name tag and the brand details agree ("Google Chrome", not
+  // the bare "Chromium" an app browser reports). Google lets real Chrome sign in; a half-disguised browser it blocks.
+  try {
+    const major = CHROME_MAJOR, full = CHROME_MAJOR + ".0.0.0";
+    c.debugger.attach("1.3");
+    c.debugger.sendCommand("Emulation.setUserAgentOverride", {
+      userAgent: CHROME_UA, platform: "Win32", acceptLanguage: "en-US,en",
+      userAgentMetadata: {
+        brands: [{ brand: "Google Chrome", version: major }, { brand: "Chromium", version: major }, { brand: "Not?A_Brand", version: "24" }],
+        fullVersionList: [{ brand: "Google Chrome", version: full }, { brand: "Chromium", version: full }, { brand: "Not?A_Brand", version: "24.0.0.0" }],
+        platform: "Windows", platformVersion: "15.0.0", architecture: "x86", model: "", mobile: false, bitness: "64", wow64: false
+      }
+    }).catch(() => {});
+    c.debugger.sendCommand("Page.enable").catch(() => {});
+    c.debugger.sendCommand("Page.addScriptToEvaluateOnNewDocument", { source: `try { Object.defineProperty(Navigator.prototype, "webdriver", { get: () => false, configurable: true }); } catch (e) {}` }).catch(() => {});
+  } catch {}
+  // YouTube has its own dark theme; Chromium's forced-dark filter can make its volume slider disappear.
+  const darkFor = url => DARK_AT_START && !(/^https?:\/\/(?:www\.|m\.|music\.)?youtube\.com\//i.test(url || "") || /^https?:\/\/youtu\.be\//i.test(url || ""));
+  const darkSet = url => { if (c.debugger.isAttached()) c.debugger.sendCommand("Emulation.setAutoDarkModeOverride", { enabled: darkFor(url) }).catch(() => {}); };
+  darkSet(c.getURL());
+  c.on("did-start-navigation", (_ev, url, _inPlace, isMainFrame) => { if (isMainFrame) darkSet(url); });
+  c.on("did-navigate", (_ev, url) => darkSet(url));
+  // links that want a new tab or window open as a tab here; small sign-in pop-ups keep their own window
+  c.setWindowOpenHandler(({ url, disposition, features }) => {
+    if (!/^https?:\/\//i.test(url) && url !== "about:blank") return { action: "deny" };
+    const signIn = /(accounts\.google|login|signin|sign-in|oauth|auth|sso|appleid|discord\.com\/(api\/)?oauth|paypal|checkout|steamcommunity\.com\/openid)/i.test(url);
+    if (disposition === "new-window" && (signIn || features)) {
+      if (!signIn && settings.popBlock !== false && !(settings.popAllow || []).includes(siteOf(c.getURL()))) { sendWc(hostOf(c), "web:popup", { url, from: c.id }); return { action: "deny" }; }
+      return { action: "allow", overrideBrowserWindowOptions: { width: 520, height: 680, autoHideMenuBar: true, backgroundColor: "#0b0b0f", icon: path.join(__dirname, "assets", "blackwall.png"), webPreferences: { partition: "persist:web" } } };
+    }
+    sendWc(hostOf(c), "web:open", { url, bg: disposition === "background-tab" });
+    return { action: "deny" };
+  });
+  // shortcuts work while a page has focus
+  c.on("before-input-event", (ev, i) => {
+    if (i.type !== "keyDown") return;
+    const k = String(i.key || "").toLowerCase(), ctl = i.control || i.meta;
+    let combo = null;
+    if (ctl && !i.alt) combo = i.shift ? ({ t: "ctrl+shift+t", tab: "ctrl+shift+tab", i: null }[k] || null) : (["t", "w", "l", "r", "tab", "d", "h", "j", "f", "1", "2", "3", "4", "5", "6", "7", "8", "9", "=", "+", "-", "0"].includes(k) ? "ctrl+" + k : null);
+    else if (k === "f5") combo = "f5"; else if (k === "f11") combo = "f11"; else if (k === "f12") combo = "f12";
+    else if (i.alt && !ctl && (k === "arrowleft" || k === "arrowright" || k === "home")) combo = "alt+" + k;
+    if (!combo) return;
+    ev.preventDefault(); sendWc(hostOf(c), "web:key", combo);
+  });
+  c.on("context-menu", (_ev, p) => {
+    const items = [], open = d => sendWc(hostOf(c), "web:open", d);
+    if (p.linkURL) items.push({ label: "Open link in new tab", click: () => open({ url: p.linkURL, bg: true }) }, { label: "Copy link", click: () => clipboard.writeText(p.linkURL) }, { type: "separator" });
+    if (p.mediaType === "image" && p.srcURL) items.push({ label: "Open image in new tab", click: () => open({ url: p.srcURL, bg: true }) }, { label: "Save image", click: () => c.downloadURL(p.srcURL) }, { label: "Copy image", click: () => c.copyImageAt(p.x, p.y) }, { type: "separator" });
+    if (p.mediaType === "video") items.push({ label: "Picture in picture", click: () => c.executeJavaScript(`(() => { const v = document.elementFromPoint(${p.x}, ${p.y}); const vid = v && (v.closest("video") || v.querySelector && v.querySelector("video")) || document.querySelector("video"); if (vid) vid.requestPictureInPicture().catch(() => {}); })()`, true) }, { type: "separator" });
+    if (p.isEditable) items.push({ role: "undo" }, { role: "cut" }, { role: "copy" }, { role: "paste" }, { role: "selectAll" }, { type: "separator" });
+    else if (p.selectionText) items.push({ role: "copy" }, { label: `Search for "${p.selectionText.slice(0, 24)}${p.selectionText.length > 24 ? "…" : ""}"`, click: () => open({ url: "https://www.google.com/search?q=" + encodeURIComponent(p.selectionText), bg: false }) }, { type: "separator" });
+    items.push({ label: "Back", enabled: c.navigationHistory.canGoBack(), click: () => c.navigationHistory.goBack() }, { label: "Forward", enabled: c.navigationHistory.canGoForward(), click: () => c.navigationHistory.goForward() }, { label: "Reload", click: () => c.reload() }, { type: "separator" }, { label: "Inspect", click: () => c.inspectElement(p.x, p.y) });
+    Menu.buildFromTemplate(items).popup({ window: BrowserWindow.fromWebContents(hostOf(c)) || win });
+  });
+});
+
+// open: { url, bounds } for a tab dragged out of a window; without it, the main window
+function createWindow(open) {
+  const b = open ? open.bounds : (settings.bounds || {});
+  const w = new BrowserWindow({
+    width: b.width || 1280, height: b.height || 820, x: b.x, y: b.y, minWidth: 520, minHeight: 360,
+    frame: false, backgroundColor: "#07070a", show: false, title: "Blackwall", icon: path.join(__dirname, "assets", "blackwall.png"),
+    webPreferences: { preload: path.join(__dirname, "preload.js"), contextIsolation: true, nodeIntegration: false, sandbox: true, webviewTag: true }
+  });
+  wins.add(w);
+  w.removeMenu();
+  if (!open && settings.maximized) w.maximize();
+  w.once("ready-to-show", () => w.show());
+  w.loadFile(path.join(__dirname, "index.html"), open ? { query: { open: open.url } } : undefined);
+  if (!open) {
+    win = w;
+    const keep = () => { if (!w.isMaximized() && !w.isMinimized() && !w.isFullScreen()) settings.bounds = w.getBounds(); settings.maximized = w.isMaximized(); };
+    w.on("resize", keep); w.on("move", keep);
+    w.on("close", () => { keep(); saveSettings(); });
+  }
+  for (const ev of ["maximize", "unmaximize", "enter-full-screen", "leave-full-screen"]) w.on(ev, () => sendWc(w.webContents, "win:state", { max: w.isMaximized(), full: w.isFullScreen() }));
+  w.on("closed", () => { wins.delete(w); if (win === w) win = [...wins][0] || null; });
+  return w;
+}
+
+const winOf = e => BrowserWindow.fromWebContents(e.sender) || win;
+ipcMain.on("win:min", e => winOf(e).minimize());
+ipcMain.on("win:max", e => { const w = winOf(e); w.isMaximized() ? w.unmaximize() : w.maximize(); });
+ipcMain.on("win:close", e => winOf(e).close());
+ipcMain.on("win:full", (e, on) => { const w = winOf(e); w.setFullScreen(on === undefined ? !w.isFullScreen() : !!on); });
+// a tab dropped on another window's tab row: every window hears it, and the one it came from closes its copy
+ipcMain.on("tab:claim", (e, tok) => {
+  if (typeof tok !== "string" || !/^[a-z0-9]{1,20}$/.test(tok)) return;
+  sendAll("tab:claimed", tok);
+  const w = winOf(e); if (w && !w.isDestroyed()) w.focus();
+});
+// a tab dragged out of a window: a new window where it was dropped, the same size as the one it came from
+ipcMain.on("win:new", (e, o) => {
+  const url = String((o && o.url) || "");
+  if (!/^https?:\/\//i.test(url)) return;
+  const src = winOf(e), sb = src.getNormalBounds();
+  const px = Math.round(Number(o.x) || sb.x), py = Math.round(Number(o.y) || sb.y);
+  const wa = require("electron").screen.getDisplayNearestPoint({ x: px, y: py }).workArea;
+  const width = Math.min(sb.width, wa.width), height = Math.min(sb.height, wa.height);
+  const x = Math.min(Math.max(px - 120, wa.x), wa.x + wa.width - width), y = Math.min(Math.max(py - 20, wa.y), wa.y + wa.height - height);
+  createWindow({ url, bounds: { x, y, width, height } });
+});
+const cfgOut = () => ({ adBlock: settings.adBlock !== false, popBlock: settings.popBlock !== false, search: settings.search || "google", forceDark: !!settings.forceDark, darkNeedsRestart: !!settings.forceDark !== DARK_AT_START });
+const darkApply = () => { try { require("electron").nativeTheme.themeSource = settings.forceDark ? "dark" : "system"; } catch {} };
+app.whenReady().then(darkApply);
+ipcMain.handle("cfg:get", () => cfgOut());
+ipcMain.handle("cfg:set", (_e, o) => { for (const k of ["adBlock", "popBlock", "search", "forceDark"]) if (o && k in o) settings[k] = o[k]; saveSettings(); darkApply(); return cfgOut(); });
+ipcMain.handle("perm:answer", (_e, { id, allow, remember }) => { const w = permWait.get(id); if (!w) return; permWait.delete(id); if (remember) for (const k of w.kinds) permSet(w.site, k, allow ? "allow" : "block"); try { w.cb(!!allow); } catch {} });
+ipcMain.handle("site:get", (_e, u) => { const site = siteOf(u); if (!site) return null; const p = {}; for (const k of ["camera", "mic", "location", "notifications"]) p[k] = permGet(site, k); return { site, perms: p, shield: !(settings.adAllow || []).includes(site), popups: !(settings.popAllow || []).includes(site) }; });
+ipcMain.handle("site:set", (_e, { url, key, val }) => {
+  const site = siteOf(url); if (!site) return null;
+  if (["camera", "mic", "location", "notifications"].includes(key) && ["ask", "allow", "block"].includes(val)) permSet(site, key, val);
+  for (const [k, list] of [["shield", "adAllow"], ["popups", "popAllow"]]) if (key === k) { const s = new Set(settings[list] || []); if (val) s.delete(site); else s.add(site); settings[list] = [...s]; saveSettings(); }
+  return true;
+});
+ipcMain.handle("site:clear", async (_e, u) => { const site = siteOf(u); if (!site) return false; const ses = session.fromPartition("persist:web"); const origins = ["https://" + site, "https://www." + site, "http://" + site, "http://www." + site]; for (const origin of origins) { try { await ses.clearStorageData({ origin }); } catch {} } try { const cs = await ses.cookies.get({ domain: site }); for (const c of cs) { const url = (c.secure ? "https://" : "http://") + c.domain.replace(/^\./, "") + c.path; await ses.cookies.remove(url, c.name).catch(() => {}); } } catch {} return true; });
+ipcMain.handle("ad:count", (_e, id) => adCounts.get(id) || 0);
+ipcMain.handle("dl:open", (_e, f) => { if (typeof f === "string" && fs.existsSync(f)) shell.openPath(f); });
+ipcMain.handle("dl:show", (_e, f) => { if (typeof f === "string" && fs.existsSync(f)) shell.showItemInFolder(f); });
+ipcMain.handle("dl:folder", () => shell.openPath(app.getPath("downloads")));
+// Import bookmarks from Chrome (or Edge, Brave, Opera GX): reads their Bookmarks file on this PC; nothing leaves the PC
+ipcMain.handle("import:bookmarks", (_e, which) => {
+  const L = process.env.LOCALAPPDATA || "", R = process.env.APPDATA || "";
+  const places = { chrome: path.join(L, "Google", "Chrome", "User Data"), edge: path.join(L, "Microsoft", "Edge", "User Data"), brave: path.join(L, "BraveSoftware", "Brave-Browser", "User Data"), operagx: path.join(R, "Opera Software", "Opera GX Stable") };
+  const base = places[which] || places.chrome;
+  const files = [];
+  try { if (fs.existsSync(path.join(base, "Bookmarks"))) files.push(path.join(base, "Bookmarks")); for (const d of fs.readdirSync(base)) if (/^(Default|Profile \d+)$/.test(d) && fs.existsSync(path.join(base, d, "Bookmarks"))) files.push(path.join(base, d, "Bookmarks")); } catch {}
+  if (!files.length) return { ok: false, err: "Couldn't find that browser's bookmarks on this PC." };
+  const conv = n => n.type === "folder" ? { f: true, t: n.name || "Folder", items: (n.children || []).map(conv).filter(Boolean) } : (n.type === "url" && /^https?:/i.test(n.url || "") ? { u: n.url, t: n.name || n.url } : null);
+  const out = [];
+  for (const f of files) {
+    try {
+      const j = JSON.parse(fs.readFileSync(f, "utf8")), r = j.roots || {};
+      const prof = path.basename(path.dirname(f));
+      const items = [];
+      if (r.bookmark_bar) items.push(...(r.bookmark_bar.children || []).map(conv).filter(Boolean));
+      for (const k of ["other", "synced"]) if (r[k] && (r[k].children || []).length) items.push({ f: true, t: k === "other" ? "Other bookmarks" : "Mobile bookmarks", items: r[k].children.map(conv).filter(Boolean) });
+      if (items.length) out.push({ prof, items });
+    } catch {}
+  }
+  return { ok: true, profiles: out };
+});
+// Top-row stats: memory used by every Blackwall process, time since it opened, and ping to the site you're on
+const START_AT = Date.now();
+ipcMain.handle("stats:get", () => {
+  // private memory (what Task Manager calls "Memory"); the working set also counts memory the processes share, many times over
+  let kb = 0; try { for (const m of app.getAppMetrics()) kb += (m.memory && (m.memory.privateBytes || m.memory.workingSetSize || 0)) || 0; } catch {}
+  return { ramMB: Math.round(kb / 1024), upS: Math.floor((Date.now() - START_AT) / 1000) };
+});
+ipcMain.handle("stats:ping", async (_e, url) => {
+  let origin = ""; try { const u = new URL(String(url)); if (!/^https?:$/.test(u.protocol)) return null; origin = u.origin; } catch { return null; }
+  const { net } = require("electron");
+  const once = async () => { const t0 = performance.now(); const c = new AbortController(); const to = setTimeout(() => c.abort(), 4000); try { await session.fromPartition("persist:web").fetch(origin + "/favicon.ico", { method: "HEAD", cache: "no-store", signal: c.signal }); return performance.now() - t0; } catch { return null; } finally { clearTimeout(to); } };
+  await once();   // the first one opens the connection; the second is the real round trip
+  const ms = await once();
+  return ms == null ? null : Math.round(ms);
+});
+ipcMain.handle("data:clear", async () => { const ses = session.fromPartition("persist:web"); await ses.clearCache(); await ses.clearStorageData(); return true; });
+ipcMain.on("open-external", (_e, u) => { if (/^https?:\/\//i.test(String(u))) shell.openExternal(u); });
+
+/* ---------- default browser: Blackwall lists itself in Windows as a browser (for you only, no admin); you pick it in Settings ---------- */
+function regBrowser() {
+  if (process.platform !== "win32" || !app.isPackaged) return;
+  const exe = process.execPath, ico = path.join(path.dirname(exe), "blackwall.ico"), cmd = `"${exe}" "%1"`;
+  const K = "HKCU\\Software", C = K + "\\Clients\\StartMenuInternet\\Blackwall";
+  const rows = [
+    [K + "\\Classes\\BlackwallHTML", "", "Blackwall web page"], [K + "\\Classes\\BlackwallHTML", "URL Protocol", ""],
+    [K + "\\Classes\\BlackwallHTML\\DefaultIcon", "", ico + ",0"], [K + "\\Classes\\BlackwallHTML\\shell\\open\\command", "", cmd],
+    [K + "\\Classes\\BlackwallHTML\\Application", "ApplicationName", "Blackwall"], [K + "\\Classes\\BlackwallHTML\\Application", "ApplicationIcon", ico + ",0"],
+    [C, "", "Blackwall"], [C + "\\DefaultIcon", "", ico + ",0"], [C + "\\shell\\open\\command", "", `"${exe}"`],
+    [C + "\\Capabilities", "ApplicationName", "Blackwall"], [C + "\\Capabilities", "ApplicationDescription", "Blackwall, a web browser in the Sothis style"], [C + "\\Capabilities", "ApplicationIcon", ico + ",0"],
+    [C + "\\Capabilities\\URLAssociations", "http", "BlackwallHTML"], [C + "\\Capabilities\\URLAssociations", "https", "BlackwallHTML"],
+    [C + "\\Capabilities\\FileAssociations", ".html", "BlackwallHTML"], [C + "\\Capabilities\\FileAssociations", ".htm", "BlackwallHTML"], [C + "\\Capabilities\\FileAssociations", ".pdf", "BlackwallHTML"],
+    [C + "\\Capabilities\\StartMenu", "StartMenuInternet", "Blackwall"],
+    [K + "\\RegisteredApplications", "Blackwall", "Software\\Clients\\StartMenuInternet\\Blackwall\\Capabilities"]
+  ];
+  if (settings.regFor === exe) return;   // already done for this copy
+  const { execFileSync } = require("child_process");
+  try { for (const [key, name, val] of rows) execFileSync("reg.exe", ["add", key].concat(name ? ["/v", name] : ["/ve"], ["/t", "REG_SZ", "/d", val, "/f"]), { windowsHide: true }); settings.regFor = exe; saveSettings(); } catch {}
+}
+ipcMain.handle("default:open", () => { regBrowser(); shell.openExternal("ms-settings:defaultapps?registeredAppUser=Blackwall"); return true; });
+ipcMain.handle("default:is", () => { try { return /blackwall/i.test(require("child_process").execFileSync("reg.exe", ["query", "HKCU\\Software\\Microsoft\\Windows\\Shell\\Associations\\UrlAssociations\\https\\UserChoice", "/v", "ProgId"], { windowsHide: true, encoding: "utf8" })); } catch { return false; } });
+// a link or file Windows asked Blackwall to open
+const argUrl = argv => { for (const a of (argv || []).slice(1)) { if (/^https?:\/\//i.test(a)) return a; if (/\.(html?|pdf)$/i.test(a) && fs.existsSync(a)) return require("url").pathToFileURL(a).href; } return ""; };
+let firstUrl = argUrl(process.argv);
+ipcMain.handle("start:url", () => { const u = firstUrl; firstUrl = ""; return u; });
+app.on("second-instance", (_e, argv) => {
+  if (!win) return; if (win.isMinimized()) win.restore(); win.focus();
+  const u = argUrl(argv); if (u) send("web:open", { url: u, bg: false });
+});
+// the Widevine part (Netflix, Spotify and other protected video) comes from this engine's own updater; don't wait on it for long
+async function wvReady() { try { const { components } = require("electron"); if (components && components.whenReady) await Promise.race([components.whenReady(), new Promise(r => setTimeout(r, 4000))]); } catch {} }
+/* ---------- updates: new versions are published in the Blackwall repo (it must stay public); files are swapped in, then a restart ---------- */
+const UPD_BASE = "https://raw.githubusercontent.com/Cloakedz/Blackwall/main/";
+const APP_VER = require("./package.json").version;
+const verCmp = (a, b) => { const x = String(a).split(".").map(Number), y = String(b).split(".").map(Number); for (let i = 0; i < 3; i++) { if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) - (y[i] || 0); } return 0; };
+let upd = { state: "idle", latest: "" }, updBusy = false;
+async function updCheck() {
+  if (updBusy || upd.state === "ready") return upd;
+  updBusy = true;
+  try {
+    const { net } = require("electron");
+    const get = async (f, bin) => { const r = await net.fetch(UPD_BASE + f + "?t=" + Date.now(), { headers: { "Cache-Control": "no-cache" } }); if (!r.ok) throw new Error(f + ": " + r.status); return bin ? Buffer.from(await r.arrayBuffer()) : r.text(); };
+    const pk = JSON.parse(await get("package.json"));
+    upd.latest = String(pk.version || "");
+    if (!upd.latest || verCmp(upd.latest, APP_VER) <= 0) { upd.state = "current"; return upd; }
+    const list = JSON.parse(await get("files.json"));
+    if (!Array.isArray(list) || !list.includes("main.js")) throw new Error("bad file list");
+    const got = {};
+    for (const f of list) { if (!/^[\w./ -]+$/.test(f) || f.includes("..")) continue; got[f] = await get(f, true); }   // everything first, so a failed download changes nothing
+    for (const [f, b] of Object.entries(got)) { const dst = path.join(__dirname, f); fs.mkdirSync(path.dirname(dst), { recursive: true }); fs.writeFileSync(dst, b); }
+    upd.state = "ready"; sendAll("upd:ready", { version: upd.latest });
+    try { const { Notification } = require("electron"); if (Notification.isSupported() && !BrowserWindow.getFocusedWindow()) new Notification({ title: "Blackwall update ready", body: "Restart Blackwall to finish updating.", icon: path.join(__dirname, "assets", "blackwall.png"), silent: true }).show(); } catch {}
+  } catch (e) { upd.state = "error"; upd.err = String(e.message || e); }
+  finally { updBusy = false; }
+  return upd;
+}
+ipcMain.handle("upd:get", () => Object.assign({ version: APP_VER }, upd));
+ipcMain.handle("upd:check", async () => { await updCheck(); return Object.assign({ version: APP_VER }, upd); });
+// coming back to the window also checks (at most every 5 minutes), so a new version shows up soon after it's out
+let updFocusAt = 0;
+app.on("browser-window-focus", () => { if (Date.now() - updFocusAt > 2 * 60e3) { updFocusAt = Date.now(); updCheck(); } });
+ipcMain.on("upd:restart", () => { app.relaunch(); app.exit(0); });
+// any change to Blackwall's own files (an update, or new files copied in) shows the update card right away
+function updWatch() {
+  let t = null;
+  const fire = name => {
+    if (!/\.(js|html|json|png|gif|css)$/i.test(String(name || ""))) return;
+    clearTimeout(t); t = setTimeout(() => {
+      let v = APP_VER; try { v = JSON.parse(fs.readFileSync(path.join(__dirname, "package.json"), "utf8")).version || v; } catch {}
+      upd.state = "ready"; upd.latest = v; sendAll("upd:ready", { version: v });
+    }, 1500);
+  };
+  for (const d of [__dirname, path.join(__dirname, "assets")]) { try { fs.watch(d, (_ev, name) => fire(name)); } catch {} }
+}
+app.whenReady().then(wvReady).then(() => { setupSession(); adLoad(); createWindow(); setTimeout(regBrowser, 3000); setTimeout(updCheck, 15000); setInterval(updCheck, 10 * 60e3); setTimeout(updWatch, 3000); });
+app.on("window-all-closed", () => app.quit());
